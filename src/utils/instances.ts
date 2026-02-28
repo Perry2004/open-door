@@ -29,6 +29,7 @@ export async function getStagehandInstance(): Promise<Stagehand> {
 				localBrowserLaunchOptions: {
 					headless: false,
 				},
+				experimental: true,
 			});
 			await stagehand.init();
 			stagehandInstance = stagehand;

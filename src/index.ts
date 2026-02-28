@@ -23,7 +23,9 @@ export const logger = pino({
 
 type InterruptPayload = {
 	value?: {
+		type?: string;
 		message?: string;
+		reason?: string;
 		reviewSuggestions?: string[];
 	};
 };
@@ -106,30 +108,53 @@ async function main() {
 				break;
 			}
 
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
 			const interruptValue = interruptPayload.value;
-			const message =
-				interruptValue?.message ??
-				"Review submission: type 'approve' to submit, or provide modification suggestions separated by ';'.";
+			const interruptType = interruptValue?.type;
+			let resumeValue: Record<string, unknown>;
 
-			if (interruptValue?.reviewSuggestions?.length) {
-				logger.info(
-					{ reviewSuggestions: interruptValue.reviewSuggestions },
-					"Review suggestions from interrupt",
-				);
+			if (interruptType === "missing_application_information") {
+				if (interruptValue?.reason) {
+					logger.info(
+						{ reason: interruptValue.reason },
+						"Fill form interruption reason",
+					);
+				}
+
+				const message =
+					interruptValue?.message ??
+					"The application form needs more information. Provide missing details to continue.";
+				const answer = (await rl.question(`${message}\n> `)).trim();
+
+				resumeValue = {
+					type: "provide_information",
+					additionalInformation: answer,
+				};
+			} else {
+				const message =
+					interruptValue?.message ??
+					"Review submission: type 'approve' to submit, or provide modification suggestions separated by ';'.";
+
+				if (interruptValue?.reviewSuggestions?.length) {
+					logger.info(
+						{ reviewSuggestions: interruptValue.reviewSuggestions },
+						"Review suggestions from interrupt",
+					);
+				}
+
+				const answer = (await rl.question(`${message}\n> `)).trim();
+				resumeValue =
+					answer.toLowerCase() === "approve"
+						? { action: "approve" }
+						: {
+								action: "modify",
+								suggestions: answer
+									.split(";")
+									.map((suggestion) => suggestion.trim())
+									.filter((suggestion) => suggestion.length > 0),
+							};
 			}
-
-			const answer = (await rl.question(`${message}\n> `)).trim();
-
-			const resumeValue =
-				answer.toLowerCase() === "approve"
-					? { action: "approve" }
-					: {
-							action: "modify",
-							suggestions: answer
-								.split(";")
-								.map((suggestion) => suggestion.trim())
-								.filter((suggestion) => suggestion.length > 0),
-						};
 
 			result = await agent.invoke(new Command({ resume: resumeValue }), config);
 		}
