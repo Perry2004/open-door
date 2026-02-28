@@ -3,6 +3,7 @@ import { type GraphNode, interrupt } from "@langchain/langgraph";
 import z from "zod";
 import { logger } from "../index.js";
 import type { AgentStateType } from "../states/state.js";
+import { createUploadResumeTool } from "../tools/upload-resume.tool.js";
 import { envVars } from "../utils/env.js";
 import { getStagehandInstance } from "../utils/instances.js";
 import type { NodeName } from "./node.types.js";
@@ -125,6 +126,12 @@ export const fillFormNode: GraphNode<
 			modelName: envVars.MODEL_NAME,
 			apiKey: envVars.AI_API_KEY,
 		},
+		tools: {
+			uploadResume: createUploadResumeTool({
+				page,
+				defaultResumePath: state.resumePath,
+			}),
+		},
 		systemPrompt:
 			"You're a helpful assistant that can control a web browser. I need you to help me submit co-op job applications.",
 	});
@@ -138,6 +145,7 @@ export const fillFormNode: GraphNode<
 		const fillResponse = await agent.execute({
 			instruction: `
 		    		Please fill out the application form on this website based on the information and resources I provided.
+		    		If the form includes a resume/CV upload input, use the uploadResume tool to attach my resume file before continuing.
 		    		${resumedMissingInformation.length > 0 ? `\n\nThis is a resumed run. Continue from the current form state and focus only on unresolved required fields: ${resumedMissingInformation.join("; ")}. Do not re-process fields that are already filled unless they are clearly incorrect.` : ""}
 		    		\n\n
 		    		Here is my resume:
