@@ -1,16 +1,17 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
-import { Stagehand } from "@browserbasehq/stagehand";
+import { fileURLToPath } from "node:url";
+import { Command } from "@langchain/langgraph";
 import { InvalidArgumentError, program } from "commander";
 import dotenv from "dotenv";
-import { PDFParse } from "pdf-parse";
 import pino from "pino";
-import { z } from "zod";
+import z from "zod";
+import { agent } from "./agent.js";
 
 dotenv.config({ path: ".env" });
 
-const logger = pino({
+export const logger = pino({
 	level: "debug",
 	transport: {
 		target: "pino-pretty",
@@ -19,6 +20,31 @@ const logger = pino({
 		},
 	},
 });
+
+type InterruptPayload = {
+	value?: {
+		message?: string;
+		reviewSuggestions?: string[];
+	};
+};
+
+function getInterruptPayload(result: unknown): InterruptPayload | undefined {
+	if (!result || typeof result !== "object") {
+		return undefined;
+	}
+
+	const maybeInterrupt = (result as { __interrupt__?: unknown }).__interrupt__;
+	if (!Array.isArray(maybeInterrupt) || maybeInterrupt.length === 0) {
+		return undefined;
+	}
+
+	const firstInterrupt = maybeInterrupt[0];
+	if (!firstInterrupt || typeof firstInterrupt !== "object") {
+		return undefined;
+	}
+
+	return firstInterrupt as InterruptPayload;
+}
 
 function validatePath(value: string): string {
 	try {
@@ -34,142 +60,90 @@ function validatePath(value: string): string {
 	}
 }
 
-program
-	.requiredOption("--job-url <url>", "Job posting URL", (value) =>
-		z.url().parse(value),
-	)
-	.requiredOption("--resume-path <path>", "Path to resume PDF", validatePath)
-	.option("--extra-prompts <path>", "Path to extra prompts file", validatePath)
-	.parse(process.argv);
+async function main() {
+	program
+		.requiredOption("--job-url <url>", "Job posting URL", (value) =>
+			z.url().parse(value),
+		)
+		.requiredOption("--resume-path <path>", "Path to resume PDF", validatePath)
+		.option(
+			"--extra-prompts <path>",
+			"Path to extra prompts file",
+			validatePath,
+		)
+		.parse(process.argv);
 
-const cliOptions = program.opts<{
-	jobUrl: string;
-	resumePath: string;
-	extraPromptsPath?: string;
-}>();
+	const cliOptions = program.opts<{
+		jobUrl: string;
+		resumePath: string;
+		extraPromptsPath?: string;
+	}>();
 
-const envVars = z
-	.object({
-		AI_API_KEY: z.string(),
-		MODEL_NAME: z.string(),
-	})
-	.parse(process.env);
+	const config = {
+		configurable: {
+			thread_id: randomUUID(),
+		},
+	};
 
-async function parseResume(filePath: string): Promise<string> {
-	const parser = new PDFParse({
-		url: filePath,
-	});
-	const result = await parser.getText();
-	return result.text;
-}
-
-async function askForApproval(promptText: string): Promise<boolean> {
 	const rl = createInterface({
 		input: process.stdin,
 		output: process.stdout,
 	});
 
+	let result = await agent.invoke(
+		{
+			jobUrl: cliOptions.jobUrl,
+			resumePath: cliOptions.resumePath,
+			extraPromptsPath: cliOptions.extraPromptsPath,
+		},
+		config,
+	);
+
 	try {
-		const answer = (await rl.question(promptText)).trim().toLowerCase();
-		return answer === "y" || answer === "yes";
+		while (true) {
+			const interruptPayload = getInterruptPayload(result);
+			if (!interruptPayload) {
+				break;
+			}
+
+			const interruptValue = interruptPayload.value;
+			const message =
+				interruptValue?.message ??
+				"Review submission: type 'approve' to submit, or provide modification suggestions separated by ';'.";
+
+			if (interruptValue?.reviewSuggestions?.length) {
+				logger.info(
+					{ reviewSuggestions: interruptValue.reviewSuggestions },
+					"Review suggestions from interrupt",
+				);
+			}
+
+			const answer = (await rl.question(`${message}\n> `)).trim();
+
+			const resumeValue =
+				answer.toLowerCase() === "approve"
+					? { action: "approve" }
+					: {
+							action: "modify",
+							suggestions: answer
+								.split(";")
+								.map((suggestion) => suggestion.trim())
+								.filter((suggestion) => suggestion.length > 0),
+						};
+
+			result = await agent.invoke(new Command({ resume: resumeValue }), config);
+		}
 	} finally {
 		rl.close();
 	}
-}
 
-async function main() {
-	const stagehand = new Stagehand({
-		env: "LOCAL",
-		model: {
-			modelName: envVars.MODEL_NAME,
-			apiKey: envVars.AI_API_KEY,
-		},
-		localBrowserLaunchOptions: {
-			headless: false,
-		},
-	});
-
-	await stagehand.init();
-	logger.info("OpenDoor Stagehand Session Started");
-
-	const page = stagehand.context.pages()[0];
-	if (!page) {
-		logger.error("No page found in the context.");
-		throw new Error("No page found in the context.");
-	}
-
-	await page.goto(cliOptions.jobUrl);
-
-	const agent = stagehand.agent({
-		mode: "hybrid",
-		model: {
-			modelName: envVars.MODEL_NAME,
-			apiKey: envVars.AI_API_KEY,
-		},
-		systemPrompt:
-			"You're a helpful assistant that can control a web browser. I need you to help me submit co-op job applications.",
-	});
-
-	const resumeText = await parseResume(cliOptions.resumePath);
-	logger.debug({ resumeText }, "Parsed resume text");
-
-	const extraPrompts = cliOptions.extraPromptsPath
-		? await readFile(cliOptions.extraPromptsPath, "utf-8")
-		: null;
-
-	const fillResult = await agent.execute({
-		instruction: `
-			Please fill out the application form on this page based on the information and resources I provided.
-			\n\n
-			Here is my resume:
-			${resumeText}
-			${extraPrompts ? `\n\nAdditional instructions:\n${extraPrompts}` : ""}
-			\n\n
-			DO NOT CLICK THE SUBMIT BUTTON.
-		`,
-		highlightCursor: true,
-	});
-	logger.debug({ fillResult }, "Fill result");
-
-	logger.debug("Form filled. Starting validation...");
-
-	const validationResult = await agent.execute({
-		instruction: `
-			Validate the filled form.
-
-			1. Review all required fields and confirm they are filled.
-			2. Check for visible validation errors or warnings.
-			3. Return a concise summary of what was validated and any fixes you applied.
-			4. Ensure the fields are filled according to the resume ${resumeText} ${extraPrompts ? `and the additional instructions ${extraPrompts}` : ""}.
-
-			DO NOT CLICK THE FINAL SUBMIT BUTTON.
-		`,
-		highlightCursor: true,
-	});
-	logger.info({ validationResult }, "Validation result");
-
-	// wait a moment before asking for approval to ensure all browser logging is complete
-	await new Promise((resolve) => setTimeout(resolve, 1000));
-	const approved = await askForApproval("Form validated. Submit now? (y/N): ");
-
-	if (!approved) {
-		logger.info("Submission cancelled by user. Browser session remains open.");
-		await new Promise(() => {});
-		return;
-	}
-
-	const submitResult = await agent.execute({
-		instruction:
-			"The user approved submission. Click the final submit button now and confirm submission status.",
-		highlightCursor: true,
-	});
-	logger.info({ submitResult }, "Submit result");
-
-	// await stagehand.close();
 	await new Promise(() => {});
 }
 
-main().catch((err) => {
-	logger.error({ err }, "Unhandled error");
-	process.exit(1);
-});
+const isMainModule =
+	process.argv[1] !== undefined &&
+	fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isMainModule) {
+	await main();
+}
