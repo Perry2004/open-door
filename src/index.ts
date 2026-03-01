@@ -4,12 +4,9 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { Command } from "@langchain/langgraph";
 import { InvalidArgumentError, program } from "commander";
-import dotenv from "dotenv";
 import pino from "pino";
 import z from "zod";
 import { agent } from "./agent.js";
-
-dotenv.config({ path: ".env" });
 
 export const logger = pino({
 	level: "debug",
@@ -108,7 +105,7 @@ async function main() {
 				break;
 			}
 
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+			await new Promise((resolve) => setTimeout(resolve, 1000));
 
 			const interruptValue = interruptPayload.value;
 			const interruptType = interruptValue?.type;
@@ -130,6 +127,48 @@ async function main() {
 				resumeValue = {
 					type: "provide_information",
 					additionalInformation: answer,
+				};
+			} else if (interruptType === "account_verification") {
+				if (interruptValue?.reason) {
+					logger.info(
+						{ reason: interruptValue.reason },
+						"Account verification interruption reason",
+					);
+				}
+
+				const message =
+					interruptValue?.message ??
+					"Email verification is required. Paste the verification code, or type 'done' after clicking the verification link.";
+				const answer = (await rl.question(`${message}\n> `)).trim();
+
+				resumeValue =
+					answer.toLowerCase() === "done"
+						? {
+								type: "account_verification",
+								action: "verification_link_clicked",
+							}
+						: {
+								type: "account_verification",
+								action: "provide_verification_code",
+								verificationCode: answer,
+							};
+			} else if (interruptType === "account_password") {
+				if (interruptValue?.reason) {
+					logger.info(
+						{ reason: interruptValue.reason },
+						"Account password interruption reason",
+					);
+				}
+
+				const message =
+					interruptValue?.message ??
+					"Please provide your account password to continue login.";
+				const answer = (await rl.question(`${message}\n> `)).trim();
+
+				resumeValue = {
+					type: "account_password",
+					action: "provide_password",
+					password: answer,
 				};
 			} else {
 				const message =
