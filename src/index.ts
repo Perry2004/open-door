@@ -1,12 +1,13 @@
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { Command } from "@langchain/langgraph";
 import { InvalidArgumentError, program } from "commander";
 import pino from "pino";
 import z from "zod";
-import { agent } from "./agent.js";
+import { agent, buildSystemPromptFromFiles } from "./agent.js";
+import {
+	closeReadlineInterfaceInstance,
+	closeStagehandInstance,
+} from "./utils/instances.js";
 
 export const logger = pino({
 	level: "debug",
@@ -17,33 +18,6 @@ export const logger = pino({
 		},
 	},
 });
-
-type InterruptPayload = {
-	value?: {
-		type?: string;
-		message?: string;
-		reason?: string;
-		reviewSuggestions?: string[];
-	};
-};
-
-function getInterruptPayload(result: unknown): InterruptPayload | undefined {
-	if (!result || typeof result !== "object") {
-		return undefined;
-	}
-
-	const maybeInterrupt = (result as { __interrupt__?: unknown }).__interrupt__;
-	if (!Array.isArray(maybeInterrupt) || maybeInterrupt.length === 0) {
-		return undefined;
-	}
-
-	const firstInterrupt = maybeInterrupt[0];
-	if (!firstInterrupt || typeof firstInterrupt !== "object") {
-		return undefined;
-	}
-
-	return firstInterrupt as InterruptPayload;
-}
 
 function validatePath(value: string): string {
 	try {
@@ -59,149 +33,59 @@ function validatePath(value: string): string {
 	}
 }
 
-async function main() {
-	program
-		.requiredOption("--job-url <url>", "Job posting URL", (value) =>
-			z.url().parse(value),
-		)
-		.requiredOption("--resume-path <path>", "Path to resume PDF", validatePath)
-		.option(
-			"--extra-prompts <path>",
-			"Path to extra prompts file",
-			validatePath,
-		)
-		.parse(process.argv);
-
-	const cliOptions = program.opts<{
-		jobUrl: string;
-		resumePath: string;
-		extraPromptsPath?: string;
-	}>();
-
-	const config = {
-		configurable: {
-			thread_id: randomUUID(),
-		},
-	};
-
-	const rl = createInterface({
-		input: process.stdin,
-		output: process.stdout,
+async function invokeAgent(input: AgentInput) {
+	const { jobUrl, resumePath, extraPrompts: extraPromptsPath } = input;
+	const applicationInfoContext = await buildSystemPromptFromFiles({
+		resumePath,
+		extraPromptsPath,
 	});
 
-	let result = await agent.invoke(
+	await agent.invoke(
 		{
-			jobUrl: cliOptions.jobUrl,
-			resumePath: cliOptions.resumePath,
-			extraPromptsPath: cliOptions.extraPromptsPath,
+			messages: [
+				{
+					role: "user",
+					content: `APPLICATION_INFO_CONTEXT:\n${applicationInfoContext}\n\nGo to this job URL and complete the application flow: ${jobUrl}`,
+				},
+			],
 		},
-		config,
+		{
+			recursionLimit: 500,
+		},
 	);
+}
 
+type AgentInput = {
+	jobUrl: string;
+	resumePath: string;
+	extraPrompts?: string;
+};
+
+async function main() {
 	try {
-		while (true) {
-			const interruptPayload = getInterruptPayload(result);
-			if (!interruptPayload) {
-				break;
-			}
-
-			await new Promise((resolve) => setTimeout(resolve, 1000));
-
-			const interruptValue = interruptPayload.value;
-			const interruptType = interruptValue?.type;
-			let resumeValue: Record<string, unknown>;
-
-			if (interruptType === "missing_application_information") {
-				if (interruptValue?.reason) {
-					logger.info(
-						{ reason: interruptValue.reason },
-						"Fill form interruption reason",
-					);
-				}
-
-				const message =
-					interruptValue?.message ??
-					"The application form needs more information. Provide missing details to continue.";
-				const answer = (await rl.question(`${message}\n> `)).trim();
-
-				resumeValue = {
-					type: "provide_information",
-					additionalInformation: answer,
-				};
-			} else if (interruptType === "account_verification") {
-				if (interruptValue?.reason) {
-					logger.info(
-						{ reason: interruptValue.reason },
-						"Account verification interruption reason",
-					);
-				}
-
-				const message =
-					interruptValue?.message ??
-					"Email verification is required. Paste the verification code, or type 'done' after clicking the verification link.";
-				const answer = (await rl.question(`${message}\n> `)).trim();
-
-				resumeValue =
-					answer.toLowerCase() === "done"
-						? {
-								type: "account_verification",
-								action: "verification_link_clicked",
-							}
-						: {
-								type: "account_verification",
-								action: "provide_verification_code",
-								verificationCode: answer,
-							};
-			} else if (interruptType === "account_password") {
-				if (interruptValue?.reason) {
-					logger.info(
-						{ reason: interruptValue.reason },
-						"Account password interruption reason",
-					);
-				}
-
-				const message =
-					interruptValue?.message ??
-					"Please provide your account password to continue login.";
-				const answer = (await rl.question(`${message}\n> `)).trim();
-
-				resumeValue = {
-					type: "account_password",
-					action: "provide_password",
-					password: answer,
-				};
-			} else {
-				const message =
-					interruptValue?.message ??
-					"Review submission: type 'approve' to submit, or provide modification suggestions separated by ';'.";
-
-				if (interruptValue?.reviewSuggestions?.length) {
-					logger.info(
-						{ reviewSuggestions: interruptValue.reviewSuggestions },
-						"Review suggestions from interrupt",
-					);
-				}
-
-				const answer = (await rl.question(`${message}\n> `)).trim();
-				resumeValue =
-					answer.toLowerCase() === "approve"
-						? { action: "approve" }
-						: {
-								action: "modify",
-								suggestions: answer
-									.split(";")
-									.map((suggestion) => suggestion.trim())
-									.filter((suggestion) => suggestion.length > 0),
-							};
-			}
-
-			result = await agent.invoke(new Command({ resume: resumeValue }), config);
-		}
+		program
+			.requiredOption("--job-url <url>", "Job posting URL", (value) =>
+				z.url().parse(value),
+			)
+			.requiredOption(
+				"--resume-path <path>",
+				"Path to resume PDF",
+				validatePath,
+			)
+			.option(
+				"--extra-prompts <path>",
+				"Path to extra prompts file",
+				validatePath,
+			)
+			.parse(process.argv);
+		const cliOptions = program.opts<AgentInput>();
+		await invokeAgent(cliOptions);
+		// keep process alive
+		await new Promise(() => {});
 	} finally {
-		rl.close();
+		await closeReadlineInterfaceInstance();
+		await closeStagehandInstance();
 	}
-
-	await new Promise(() => {});
 }
 
 const isMainModule =
